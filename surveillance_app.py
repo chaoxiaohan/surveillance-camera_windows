@@ -6,6 +6,18 @@ import threading
 import glob
 from datetime import datetime
 from pathlib import Path
+import subprocess
+import shutil
+import tempfile
+import numpy as np
+
+# optional audio libs
+try:
+    import sounddevice as sd
+    import soundfile as sf
+    SOUNDDEVICE_AVAILABLE = True
+except Exception:
+    SOUNDDEVICE_AVAILABLE = False
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -53,16 +65,139 @@ def cleanup_old_files(path, limit_bytes=MAX_TOTAL_BYTES):
     return removed
 
 
+class AudioRecorder:
+    """Simple audio recorder using sounddevice + soundfile.
+    Writes to WAV file until stopped. Non-blocking start/stop.
+    """
+    def __init__(self, path, samplerate=44100, channels=1):
+        self.path = path
+        self.samplerate = samplerate
+        self.channels = channels
+        self._stream = None
+        self._file = None
+
+    def start(self):
+        if not SOUNDDEVICE_AVAILABLE:
+            raise RuntimeError('sounddevice/soundfile not available')
+
+        self._file = sf.SoundFile(self.path, mode='w', samplerate=self.samplerate, channels=self.channels)
+
+        def callback(indata, frames, time_info, status):
+            if status:
+                # ignore
+                pass
+            # write a copy to avoid referencing temporary buffer
+            try:
+                self._file.write(indata.copy())
+            except Exception:
+                pass
+
+        self._stream = sd.InputStream(samplerate=self.samplerate, channels=self.channels, callback=callback)
+        self._stream.start()
+
+    def stop(self):
+        try:
+            if self._stream is not None:
+                self._stream.stop()
+                self._stream.close()
+                self._stream = None
+        except Exception:
+            pass
+        try:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+        except Exception:
+            pass
+
+
+def finalize_segment(temp_video, temp_audio, final_path, status_signal=None, actual_fps=None):
+    """If ffmpeg is available and temp_audio exists, mux audio+video into final_path.
+    Always re-encode video with actual measured FPS to ensure correct playback speed.
+    Otherwise move/rename temp_video -> final_path and keep audio aside.
+    status_signal: optional Qt Signal to emit status strings.
+    actual_fps: measured FPS during recording (frames / duration)
+    """
+    try:
+        if temp_audio and os.path.exists(temp_audio) and shutil.which('ffmpeg'):
+            # 始终使用实际测量的帧率重新编码，确保播放速度正确
+            if actual_fps and actual_fps > 0:
+                if status_signal:
+                    status_signal.emit(f'合并中 (实际帧率: {actual_fps:.1f} FPS)...')
+                
+                # 使用 ffmpeg 重新编码视频，设置正确的帧率
+                # 只在输入端指定帧率，让 ffmpeg 重新解释时间戳
+                cmd = [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+                    '-r', str(actual_fps),  # 输入帧率（告诉 ffmpeg 读取视频时按此帧率解释）
+                    '-i', temp_video,
+                    '-i', temp_audio,
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                    '-c:a', 'aac', '-b:a', '128k',
+                    '-shortest',  # 以较短的流为准（避免音视频时长不一致）
+                    final_path
+                ]
+            else:
+                # 没有有效的帧率信息，直接复制
+                cmd = [
+                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                    '-i', temp_video, '-i', temp_audio,
+                    '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
+                    '-shortest',
+                    final_path
+                ]
+            
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if p.returncode == 0:
+                # remove temp files
+                try:
+                    os.remove(temp_video)
+                except Exception:
+                    pass
+                try:
+                    os.remove(temp_audio)
+                except Exception:
+                    pass
+                if status_signal:
+                    status_signal.emit('分段已合并音频')
+                return True
+            else:
+                err_msg = p.stderr.decode('utf-8', errors='ignore') if p.stderr else ''
+                if status_signal:
+                    status_signal.emit(f'ffmpeg 合并失败: {err_msg[:100]}')
+                # fallthrough to move
+        # fallback: move temp_video to final
+        try:
+            shutil.move(temp_video, final_path)
+        except Exception:
+            # attempt copy
+            try:
+                shutil.copy2(temp_video, final_path)
+                os.remove(temp_video)
+            except Exception:
+                pass
+        if status_signal:
+            status_signal.emit('分段保存为文件')
+    except Exception as e:
+        if status_signal:
+            status_signal.emit(f'合并/保存段失败: {e}')
+    return False
+
+
 class CaptureWorker(QtCore.QThread):
     frame_received = QtCore.Signal(object)
     status = QtCore.Signal(str)
 
-    def __init__(self, device_index=0, resolution=(1280, 720), fps=30, encoder='mp4v', parent=None):
+    def __init__(self, device_index=0, resolution=(1280, 720), fps=30, encoder='mp4v', audio_enabled=False, parent=None):
         super().__init__(parent)
         self.device_index = device_index
         self.resolution = resolution
         self.fps = fps
         self.encoder = encoder
+        self.audio_enabled = audio_enabled and SOUNDDEVICE_AVAILABLE
+        self.audio_samplerate = 44100
+        self.audio_channels = 1
+        self._audio_recorder = None
         self._running = False
         self._record = False
         self.out_dir = str(Path.cwd() / 'recordings')
@@ -71,6 +206,9 @@ class CaptureWorker(QtCore.QThread):
         self.segment_start = None
         self.frame_size = None
         self._cap = None
+        # 用于计算实际 FPS
+        self._frame_count = 0
+        self._record_start_time = None
 
     def run(self):
         # 优先尝试 DSHOW (Windows)，否则默认
@@ -109,26 +247,46 @@ class CaptureWorker(QtCore.QThread):
             # 发送预览帧
             self.frame_received.emit(frame.copy())
 
-            # 录制逻辑
+            # 录制逻辑（包含音频录制与分段合并）
             if self._record:
                 if self.writer is None:
                     ensure_dir(self.out_dir)
                     cleanup_old_files(self.out_dir)
                     filename = now.strftime('%Y%m%d_%H%M%S') + '.mp4'
-                    path = str(Path(self.out_dir) / filename)
+                    final_path = str(Path(self.out_dir) / filename)
+                    temp_video = final_path + '.vtmp.mp4'
+                    temp_audio = final_path + '.atmp.wav' if self.audio_enabled else None
                     h, w = frame.shape[:2]
                     self.frame_size = (w, h)
                     
+                    # 使用用户设定的 FPS 作为初始值（实际 FPS 会在录制完成后重新计算）
+                    # 摄像头的 CAP_PROP_FPS 往往不准确，所以使用固定值先写入
+                    initial_fps = self.fps
+                    
                     try:
                         fourcc = cv2.VideoWriter_fourcc(*self.encoder)
-                        # 如果是 H264，有时需要 openh264 dll，或者系统安装了 ffmpeg
-                        self.writer = cv2.VideoWriter(path, fourcc, self.fps, self.frame_size)
+                        self.writer = cv2.VideoWriter(temp_video, fourcc, initial_fps, self.frame_size)
                         if not self.writer.isOpened():
                             self.status.emit(f'无法初始化编码器 {self.encoder}，尝试默认 mp4v')
                             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                            self.writer = cv2.VideoWriter(path, fourcc, self.fps, self.frame_size)
-                        
+                            self.writer = cv2.VideoWriter(temp_video, fourcc, initial_fps, self.frame_size)
+
+                        # start audio recorder if requested
+                        if self.audio_enabled:
+                            try:
+                                self._audio_recorder = AudioRecorder(temp_audio, samplerate=self.audio_samplerate, channels=self.audio_channels)
+                                self._audio_recorder.start()
+                            except Exception as e:
+                                self.status.emit(f'音频启动失败: {e}')
+                                self._audio_recorder = None
+
+                        self._current_final = final_path
+                        self._current_temp_video = temp_video
+                        self._current_temp_audio = temp_audio
+                        self._current_initial_fps = initial_fps
                         self.segment_start = time.time()
+                        self._record_start_time = time.time()
+                        self._frame_count = 0
                         self.status.emit(f'正在录制: {filename}')
                     except Exception as e:
                         self.status.emit(f'录制初始化错误: {e}')
@@ -138,6 +296,7 @@ class CaptureWorker(QtCore.QThread):
                 if self.writer:
                     try:
                         self.writer.write(frame)
+                        self._frame_count += 1
                     except Exception:
                         pass
 
@@ -147,8 +306,35 @@ class CaptureWorker(QtCore.QThread):
                         self.writer.release()
                     except Exception:
                         pass
+
+                    # stop audio recorder for this segment
+                    if self._audio_recorder:
+                        try:
+                            self._audio_recorder.stop()
+                        except Exception:
+                            pass
+
+                    # 计算实际录制时长和帧率
+                    actual_duration = time.time() - self._record_start_time if self._record_start_time else 0
+                    actual_fps_measured = self._frame_count / actual_duration if actual_duration > 0 else self._current_initial_fps
+                    
+                    # finalize (mux) this segment，传递实际测量的 FPS
+                    try:
+                        finalize_segment(
+                            self._current_temp_video, 
+                            self._current_temp_audio, 
+                            self._current_final, 
+                            self.status,
+                            actual_fps=actual_fps_measured
+                        )
+                    except Exception:
+                        pass
+
                     self.writer = None
+                    self._audio_recorder = None
                     self.segment_start = None
+                    self._frame_count = 0
+                    self._record_start_time = None
                     self.status.emit('分段保存完成，准备新文件')
 
                 # 定期清理检查 (每60s)
@@ -163,8 +349,33 @@ class CaptureWorker(QtCore.QThread):
                         self.writer.release()
                     except Exception:
                         pass
+                    # stop audio recorder and finalize
+                    if self._audio_recorder:
+                        try:
+                            self._audio_recorder.stop()
+                        except Exception:
+                            pass
+                        
+                        # 计算实际录制时长和帧率
+                        actual_duration = time.time() - self._record_start_time if self._record_start_time else 0
+                        actual_fps_measured = self._frame_count / actual_duration if actual_duration > 0 else self._current_initial_fps
+                        
+                        try:
+                            finalize_segment(
+                                self._current_temp_video, 
+                                self._current_temp_audio, 
+                                self._current_final, 
+                                self.status,
+                                actual_fps=actual_fps_measured
+                            )
+                        except Exception:
+                            pass
+
                     self.writer = None
+                    self._audio_recorder = None
                     self.segment_start = None
+                    self._frame_count = 0
+                    self._record_start_time = None
                     self.status.emit('录制已停止，继续预览')
 
             # 控制循环速度，避免占用过高 CPU，同时尽量接近目标 FPS
@@ -231,7 +442,7 @@ class VideoWidget(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('精美视频监控 (FFmpeg/OpenCV)')
+        self.setWindowTitle('视频监控电脑端@choshokan')
         self.resize(1000, 700)
 
         self.worker = None
@@ -257,11 +468,28 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 编码器
         self.enc_combo = QtWidgets.QComboBox()
+        # 默认只添加兼容性更好的 MPEG-4 编码器 (mp4v)
+        # 仅在检测到 FFmpeg 时才展示 H.264 相关选项，以避免加载系统上不兼容的 OpenH264 库
         self.enc_combo.addItem("MPEG-4 (mp4v)", "mp4v")
-        self.enc_combo.addItem("H.264 (avc1)", "avc1")
-        self.enc_combo.addItem("H.264 (h264)", "h264")
-        self.enc_combo.addItem("H.264 (x264)", "x264")
-        self.enc_combo.setToolTip("如果 H.264 无法使用，将自动回退到 mp4v")
+        if shutil.which('ffmpeg'):
+            self.enc_combo.addItem("H.264 (avc1)", "avc1")
+            self.enc_combo.addItem("H.264 (h264)", "h264")
+            self.enc_combo.addItem("H.264 (x264)", "x264")
+            self.enc_combo.setToolTip("检测到 FFmpeg，可选择 H.264；否则使用 mp4v")
+        else:
+            self.enc_combo.setToolTip("系统未检测到 FFmpeg，已隐藏 H.264 选项以避免 OpenH264 冲突")
+        # 默认选择第一个 (mp4v)
+        self.enc_combo.setCurrentIndex(0)
+        
+        # 音频录制开关
+        self.audio_chk = QtWidgets.QCheckBox('录音')
+        if not SOUNDDEVICE_AVAILABLE:
+            self.audio_chk.setEnabled(False)
+            self.audio_chk.setToolTip('未检测到 sounddevice/soundfile，无法录音')
+        else:
+            self.audio_chk.setChecked(True)
+            if not shutil.which('ffmpeg'):
+                self.audio_chk.setToolTip('未检测到 FFmpeg，录音将保存为单独的 .wav 文件')
 
         # 录制控制
         self.start_btn = QtWidgets.QPushButton('开始录制')
@@ -295,6 +523,7 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_layout.addWidget(self.fps_combo)
         settings_layout.addWidget(QtWidgets.QLabel('编码:'))
         settings_layout.addWidget(self.enc_combo)
+        settings_layout.addWidget(self.audio_chk)
 
         # Control Bar
         ctrl_layout = QtWidgets.QHBoxLayout()
@@ -327,6 +556,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.res_combo.currentIndexChanged.connect(self.restart_camera)
         self.fps_combo.currentIndexChanged.connect(self.restart_camera)
         self.enc_combo.currentIndexChanged.connect(self.update_encoder_only)
+        self.audio_chk.stateChanged.connect(self.restart_camera)
 
         # Timer for UI update
         self.ui_timer = QtCore.QTimer()
@@ -382,8 +612,9 @@ class MainWindow(QtWidgets.QMainWindow):
         res = self.res_combo.currentData()
         fps = self.fps_combo.currentData()
         enc = self.enc_combo.currentData()
+        audio_enabled = self.audio_chk.isChecked()
 
-        self.worker = CaptureWorker(device_index=idx, resolution=res, fps=fps, encoder=enc)
+        self.worker = CaptureWorker(device_index=idx, resolution=res, fps=fps, encoder=enc, audio_enabled=audio_enabled)
         self.worker.out_dir = self.out_dir_edit.text()
         self.worker.frame_received.connect(self.on_frame)
         self.worker.status.connect(self.on_status)
